@@ -186,7 +186,6 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
 
     // We sent the packet, not wait for the ACK
     unsigned char buffer[STCP_MTU];
-    // this function already calls ntoHdr
     int len = readWithTimeout(fd, buffer, STCP_MIN_TIMEOUT);
 
     if (len == STCP_READ_TIMED_OUT) {
