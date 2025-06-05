@@ -17,8 +17,11 @@
 
 #include <assert.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -27,17 +30,72 @@
 #include "stcp.h"
 #include "tcp.h"
 
+// hopefully we use c99 or greater
+#include <stdbool.h>
+
 #define STCP_SUCCESS 1
 #define STCP_ERROR -1
 
 typedef struct {
 
-    int DELETE_ME;     /* used only to make this compile */
-
     /* YOUR CODE HERE */
+    packet *lastPacketSent;
+    int fd;
+    int state;
 
 } stcp_send_ctrl_blk;
 /* ADD ANY EXTRA FUNCTIONS HERE */
+static bool packetChecksum(packet *p, int len) {
+    printf("packetChecksum\n");
+    unsigned short checksumField = p->hdr->checksum;
+    printf("accessed checksum\n");
+    p->hdr->checksum = 0;
+    unsigned short actualChecksum = ipchecksum(p->hdr, p->len);
+    printf("called upchecksum\n");
+
+    if (checksumField == actualChecksum) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+static packet *checkpkt(unsigned char *buffer, int len, int expectedFlags, unsigned int expectedSeqno) {
+    // encapsulate this into a checkpkt function
+    // allocate packet
+    // htonHdr the header field
+    // set len and header fields
+    // check flags by taking in a flags int
+    // check sequence # by taking in expected seq # or last packet
+    // should return packet *, or NULL?
+
+    // is the len the len of the data, or packet?
+    // packet *checkpkt(unsigned char *buffer, int len, int expected flags, unsigned int expected seq no);
+    packet *rpkt = malloc(sizeof(packet));
+    if (!rpkt) {
+        return NULL;
+    }
+    rpkt->len = len;
+    rpkt->hdr = (tcpheader *) buffer;
+    htonHdr(rpkt->hdr);
+
+    if ((rpkt->hdr->flags & expectedFlags) != expectedFlags) {
+        printf("receiver did not send ack packet back\n");
+        // TODO: send reset?
+        goto cleanupPacket;
+    }
+
+    if (rpkt->hdr->seqNo != expectedSeqno) {
+        printf("expected sequence number %u but got %u\n", expectedSeqno, rpkt->hdr->seqNo);
+        goto cleanupPacket;
+    }
+
+    return rpkt;
+
+cleanupPacket:
+    free(rpkt);
+    return NULL;
+}
 
 /*
  * Send STCP. This routine is to send all the data (len bytes).  If more
@@ -82,12 +140,111 @@ int stcp_send(stcp_send_ctrl_blk *stcp_CB, unsigned char* data, int length) {
  */
 stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
                              int receiversPort) {
-
     logLog("init", "Sending from port %d to <%s, %d>", sendersPort, destination, receiversPort);
     // Since I am the sender, the destination and receiversPort name the other side
     int fd = udp_open(destination, receiversPort, sendersPort);
+    /*
+     * what does this do? I think this means ignore the fd?
+     * actually it is here to suppress compiler warnings about unused
+     * variables apparently
+     */
     (void) fd;
+
     /* YOUR CODE HERE */
+
+    packet *p = malloc(sizeof(packet));
+    if (p == NULL) {
+        // This function returns NULL if an error has occured
+        return NULL;
+    }
+    // starting seq # = 0, not random
+
+    // len should be sizeof(tcpheader), because the initial SYN packet
+    // only contains the header and no data
+    createSegment(p, SYN, STCP_MSS, 0, 0, NULL, 0);
+
+    // prepare the data to be in network order
+    htonHdr(p->hdr);
+
+    p->hdr->checksum = ipchecksum(p->hdr, p->len);
+
+    dump('s', p->hdr, p->len);
+    // return control block with useful information
+    stcp_send_ctrl_blk *stcpSCB = malloc(sizeof(stcp_send_ctrl_blk));
+
+    if (stcpSCB == NULL) {
+        goto cleanupPacket;
+    }
+
+    stcpSCB->lastPacketSent = p;
+    stcpSCB->fd = fd;
+
+
+    // idk if we need to worry about little and big endian...
+    // can encapsulate this into a sendpkt(int fd, void *pkt, int len)
+    // function that dumps, calls htoNdr and adds checksum
+    send(fd, p, p->len, 0);
+
+    stcpSCB->state = STCP_SENDER_SYN_SENT;
+
+    // We sent the packet, not wait for the ACK
+    unsigned char buffer[STCP_MTU];
+    // this function already calls ntoHdr
+    int len = readWithTimeout(fd, buffer, STCP_MIN_TIMEOUT);
+
+    if (len == STCP_READ_TIMED_OUT) {
+        // TODO: Handle this case
+        goto cleanupBoth;
+    } else if (len == STCP_READ_PERMANENT_FAILURE) {
+        goto cleanupBoth;
+    }
+
+    stcpSCB->state = STCP_SENDER_ESTABLISHED;
+
+
+    // encapsulate this into a checkpkt function
+    // allocate packet
+    // htonHdr the header field
+    // set len and header fields
+    // check flags by taking in a flags int
+    // check sequence # by taking in expected seq # or last packet
+    // should return packet *, or NULL?
+
+    // is the len the len of the data, or packet?
+    // packet *checkpkt(unsigned char *buffer, int len, int expected flags, unsigned int expected seq no);
+    // START FUNC HERE
+    // checkpkt(buffer, len, ACK, p->hdr->seqNo + 1);
+    packet *rpkt = malloc(sizeof(packet));
+    if (!rpkt) {
+        goto cleanupBoth;
+    }
+    rpkt->len = len;
+    rpkt->hdr = (tcpheader *) buffer;
+    htonHdr(rpkt->hdr);
+
+
+    if ((rpkt->hdr->flags & ACK) != ACK) {
+        printf("receiver did not send ack packet back\n");
+        // TODO: send reset?
+        goto cleanupBoth;
+    }
+    // END FUNC HERE
+
+    if (rpkt->hdr->ackNo != 1) {
+        printf("ack number should be %d but was %d\n", p->hdr->seqNo + 1, rpkt->hdr->ackNo);
+    }
+
+    memcpy(rpkt->data, buffer + sizeof(tcpheader), len - sizeof(tcpheader));
+
+    stcpSCB->state = STCP_SENDER_ESTABLISHED;
+    packetChecksum(rpkt, len);
+
+    return stcpSCB;
+
+cleanupBoth:
+    free(stcpSCB);
+cleanupPacket:
+    free(p);
     return NULL;
 }
 
@@ -135,7 +292,8 @@ int main(int argc, char **argv) {
     unsigned char buffer[STCP_MSS];
     int num_read_bytes;
 
-    logConfig("sender", "init,segment,error,failure");
+    // ADD packet to the logging
+    logConfig("sender", "init,segment,error,failure,packet");
     /* Verify that the arguments are right */
     if (argc > 5 || argc == 1) {
         fprintf(stderr, "usage: sender DestinationIPAddress/Name receiveDataOnPort sendDataToPort filename\n");
