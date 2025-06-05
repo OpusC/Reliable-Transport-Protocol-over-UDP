@@ -60,17 +60,12 @@ static bool packetChecksum(packet *p, int len) {
     }
 }
 
-static packet *checkpkt(unsigned char *buffer, int len, int expectedFlags, unsigned int expectedSeqno) {
-    // encapsulate this into a checkpkt function
-    // allocate packet
-    // htonHdr the header field
-    // set len and header fields
-    // check flags by taking in a flags int
-    // check sequence # by taking in expected seq # or last packet
-    // should return packet *, or NULL?
 
-    // is the len the len of the data, or packet?
-    // packet *checkpkt(unsigned char *buffer, int len, int expected flags, unsigned int expected seq no);
+static void bfrToPkt(unsigned char *buffer, packet *pkt, int len) {
+    memcpy(pkt->data, buffer + sizeof(tcpheader), len - sizeof(tcpheader));
+};
+
+static packet *checkpkt(unsigned char *buffer, int len, int expectedFlags, unsigned int expectedAckno) {
     packet *rpkt = malloc(sizeof(packet));
     if (!rpkt) {
         return NULL;
@@ -85,10 +80,12 @@ static packet *checkpkt(unsigned char *buffer, int len, int expectedFlags, unsig
         goto cleanupPacket;
     }
 
-    if (rpkt->hdr->seqNo != expectedSeqno) {
-        printf("expected sequence number %u but got %u\n", expectedSeqno, rpkt->hdr->seqNo);
+    if (rpkt->hdr->ackNo != expectedAckno) {
+        printf("expected sequence number %u but got %u\n", expectedAckno, rpkt->hdr->ackNo);
         goto cleanupPacket;
     }
+
+    bfrToPkt(buffer, rpkt, len);
 
     return rpkt;
 
@@ -201,40 +198,14 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
 
     stcpSCB->state = STCP_SENDER_ESTABLISHED;
 
-
-    // encapsulate this into a checkpkt function
-    // allocate packet
-    // htonHdr the header field
-    // set len and header fields
-    // check flags by taking in a flags int
-    // check sequence # by taking in expected seq # or last packet
-    // should return packet *, or NULL?
-
-    // is the len the len of the data, or packet?
-    // packet *checkpkt(unsigned char *buffer, int len, int expected flags, unsigned int expected seq no);
-    // START FUNC HERE
-    // checkpkt(buffer, len, ACK, p->hdr->seqNo + 1);
-    packet *rpkt = malloc(sizeof(packet));
+    // Should this also do the memcpy, checksum?
+    packet *rpkt = checkpkt(buffer, len, ACK, p->hdr->seqNo + 1);
     if (!rpkt) {
+        printf("checkpkt error\n");
         goto cleanupBoth;
     }
-    rpkt->len = len;
-    rpkt->hdr = (tcpheader *) buffer;
-    htonHdr(rpkt->hdr);
 
 
-    if ((rpkt->hdr->flags & ACK) != ACK) {
-        printf("receiver did not send ack packet back\n");
-        // TODO: send reset?
-        goto cleanupBoth;
-    }
-    // END FUNC HERE
-
-    if (rpkt->hdr->ackNo != 1) {
-        printf("ack number should be %d but was %d\n", p->hdr->seqNo + 1, rpkt->hdr->ackNo);
-    }
-
-    memcpy(rpkt->data, buffer + sizeof(tcpheader), len - sizeof(tcpheader));
 
     stcpSCB->state = STCP_SENDER_ESTABLISHED;
     packetChecksum(rpkt, len);
