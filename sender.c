@@ -39,19 +39,18 @@
 typedef struct {
 
     /* YOUR CODE HERE */
-    packet *lastPacketSent;
+    // THESE PKT HEADERS WILL ALWAYS BE IN NETWORK ORDER
+    packet *pktSent;
+    packet *pktRec;
     int fd;
     int state;
 
 } stcp_send_ctrl_blk;
 /* ADD ANY EXTRA FUNCTIONS HERE */
 static bool packetChecksum(packet *p, int len) {
-    printf("packetChecksum\n");
     unsigned short checksumField = p->hdr->checksum;
-    printf("accessed checksum\n");
     p->hdr->checksum = 0;
     unsigned short actualChecksum = ipchecksum(p->hdr, p->len);
-    printf("called upchecksum\n");
 
     if (checksumField == actualChecksum) {
         return true;
@@ -60,38 +59,113 @@ static bool packetChecksum(packet *p, int len) {
     }
 }
 
+static unsigned short nextSeq(int len, unsigned int lastSentSeq) {
+    // TODO: handle wrap-around case. Ensure numbers cannot be negative
+    // Right now: packet length must be at least 20, because 
+    // sizeof(tcpheader) == 20
+    unsigned int last = ntohl(lastSentSeq);
+    printf("last len %d\nlast sent seq %u\n", len, last);
+    return (unsigned int) (len - 20) + last;
+}
 
-static void bfrToPkt(unsigned char *buffer, packet *pkt, int len) {
-    memcpy(pkt->data, buffer + sizeof(tcpheader), len - sizeof(tcpheader));
-};
+static unsigned short nextAck(int len, unsigned int receivedSeq) {
+    // TODO: handle wrap-around case. Ensure numbers cannot be negative
+    // Right now: packet length must be at least 20, because 
+    // sizeof(tcpheader) == 20
+    printf("last len %d\nlast received seq %u\n", len, receivedSeq);
+    return (unsigned int) (len - 20) + receivedSeq;
+}
 
-static packet *checkpkt(unsigned char *buffer, int len, int expectedFlags, unsigned int expectedAckno) {
-    packet *rpkt = malloc(sizeof(packet));
-    if (!rpkt) {
+static void setStcbSCBReceivedPkt(stcp_send_ctrl_blk *cb, packet *pkt) {
+    if (cb->pktRec != NULL) {
+        printf("free ctrl_blk pkt\n");
+        free(cb->pktRec);
+        cb->pktRec = NULL;
+    }
+    cb->pktRec = pkt;
+}
+
+static void setStcbSentPkt(stcp_send_ctrl_blk *cb, packet *pkt) {
+    if (cb == NULL) {
+        printf("cb is NULL\n");
+        return;
+    }
+
+    if (cb->pktSent != NULL) {
+        printf("last packet sent s NULL, freeing\n");
+        free(cb->pktSent);
+        cb->pktSent = NULL;
+    }
+
+    if (pkt == NULL) {
+        printf("packet sent into set StcbSentPkt is NULL\n");
+    }
+
+    cb->pktSent = pkt;
+}
+
+/*
+ * Allocates a packet, sets the flags, receive window, seq and ack #s
+ * and data
+ * also prints packet before it is sent
+ */
+static packet *preparepkt(int flags, unsigned short rwnd, unsigned int seq, unsigned int ack, unsigned char *data, int len) {
+
+    packet *p = malloc(sizeof(packet));
+    if (p == NULL) {
+        // This function returns NULL if an error has occured
         return NULL;
     }
-    rpkt->len = len;
-    rpkt->hdr = (tcpheader *) buffer;
-    htonHdr(rpkt->hdr);
 
-    if ((rpkt->hdr->flags & expectedFlags) != expectedFlags) {
+    // len should be sizeof(tcpheader), because the initial SYN packet
+    // only contains the header and no data
+    createSegment(p, flags, STCP_MSS, seq, ack, data, len);
+
+    dump('s', p->hdr, p->len);
+
+    // header to network order
+    htonHdr(p->hdr);
+
+    // write the checksum
+    p->hdr->checksum = ipchecksum(p->hdr, p->len);
+
+    // print packet info, possibly do this before htonHdr
+
+    return p;
+}
+
+
+static packet *bfrToPkt(unsigned char *buffer, int len) {
+    packet *pkt = malloc(sizeof(packet));
+    if (!pkt) {
+        return NULL;
+    }
+
+    pkt->len = len;
+
+    memcpy(pkt->data, buffer, len);
+    pkt->hdr = (tcpheader *) pkt->data;
+    htonHdr(pkt->hdr);
+    printf("received pkt seq %hu\n", pkt->hdr->seqNo);
+
+    return pkt;
+};
+
+static bool checkpktflagsAck(packet *pkt, int expectedFlags, unsigned int expectedAckno) {
+
+    if ((pkt->hdr->flags & expectedFlags) != expectedFlags) {
         printf("receiver did not send ack packet back\n");
         // TODO: send reset?
-        goto cleanupPacket;
+        return false;
     }
 
-    if (rpkt->hdr->ackNo != expectedAckno) {
-        printf("expected sequence number %u but got %u\n", expectedAckno, rpkt->hdr->ackNo);
-        goto cleanupPacket;
+    if (pkt->hdr->ackNo != expectedAckno) {
+        printf("expected sequence number %u but got %u\n", expectedAckno, pkt->hdr->ackNo);
+        return false;
     }
 
-    bfrToPkt(buffer, rpkt, len);
 
-    return rpkt;
-
-cleanupPacket:
-    free(rpkt);
-    return NULL;
+    return true;
 }
 
 /*
@@ -111,11 +185,59 @@ cleanupPacket:
  */
 int stcp_send(stcp_send_ctrl_blk *stcp_CB, unsigned char* data, int length) {
 
+    // example usage
+    // if (stcp_send(cb, buffer, num_read_bytes) == STCP_ERROR) {
+
     /* YOUR CODE HERE */
     // For now, do NOT break data into multiple packets. Send one packet
     // then close the connection
 
+    // TODO: loop to break the data into pieces and call preparepkt
+
+    printf("last Rpacket length: %u\n", stcp_CB->pktRec->len);
+    // create packet and send it
+    unsigned int nSeq = nextSeq(stcp_CB->pktSent->len, ntohl(stcp_CB->pktSent->hdr->seqNo));
+    unsigned int nAck = nextAck(stcp_CB->pktRec->len, ntohl(stcp_CB->pktRec->hdr->seqNo));
+    packet *spkt = preparepkt(ACK, STCP_MSS, nSeq, nAck, data, length); 
+    setStcbSentPkt(stcp_CB, spkt);
+    send(stcp_CB->fd, spkt, spkt->len, 0);
+
+    // wait for ack and check it
+
+    unsigned char buffer[STCP_MTU];
+    int len = readWithTimeout(stcp_CB->fd, buffer, STCP_MIN_TIMEOUT);
+
+    if (len == STCP_READ_TIMED_OUT) {
+        // TODO: Handle this case properly
+        goto cleanupPacket;
+    } else if (len == STCP_READ_PERMANENT_FAILURE) {
+        goto cleanupPacket;
+    }
+
+    // Move received data to packet struct
+    packet *rpkt = bfrToPkt(buffer, len);
+
+    // Check packet has ACK flag and correct seq no
+    // TODO: check ackNo at some point
+    checkpktflagsAck(rpkt, ACK, rpkt->hdr->seqNo + 1);
+
+    // TODO: Handle this case properly
+    if (!rpkt) {
+        printf("checkpkt error\n");
+        goto cleanupPacket;
+    }
+
+    if (!packetChecksum(rpkt, len)) {
+        printf("received packet has corrupted data\n");
+        goto cleanupPacket;
+    }
+
+    setStcbSCBReceivedPkt(stcp_CB, rpkt);
     return STCP_SUCCESS;
+
+cleanupPacket:
+    free(spkt);
+    return STCP_ERROR;
 }
 
 
@@ -136,7 +258,7 @@ int stcp_send(stcp_send_ctrl_blk *stcp_CB, unsigned char* data, int length) {
  * is no long term relationship between the client and server.
  */
 stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
-                             int receiversPort) {
+                               int receiversPort) {
     logLog("init", "Sending from port %d to <%s, %d>", sendersPort, destination, receiversPort);
     // Since I am the sender, the destination and receiversPort name the other side
     int fd = udp_open(destination, receiversPort, sendersPort);
@@ -149,37 +271,24 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
 
     /* YOUR CODE HERE */
 
-    packet *p = malloc(sizeof(packet));
-    if (p == NULL) {
-        // This function returns NULL if an error has occured
-        return NULL;
-    }
     // starting seq # = 0, not random
 
-    // len should be sizeof(tcpheader), because the initial SYN packet
-    // only contains the header and no data
-    createSegment(p, SYN, STCP_MSS, 0, 0, NULL, 0);
+    packet *p = preparepkt(SYN, 0, 0, 0, NULL, 0);
 
-    // prepare the data to be in network order
-    htonHdr(p->hdr);
-
-    p->hdr->checksum = ipchecksum(p->hdr, p->len);
-
-    dump('s', p->hdr, p->len);
-    // return control block with useful information
     stcp_send_ctrl_blk *stcpSCB = malloc(sizeof(stcp_send_ctrl_blk));
+    stcpSCB->pktSent = NULL;
+    stcpSCB->pktRec = NULL;
+    stcpSCB->fd = fd;
+    stcpSCB->state = STCP_SENDER_CLOSED;
+
 
     if (stcpSCB == NULL) {
+        printf("malloc failed for ctrl blk\n");
         goto cleanupPacket;
     }
 
-    stcpSCB->lastPacketSent = p;
-    stcpSCB->fd = fd;
+    setStcbSentPkt(stcpSCB, p);
 
-
-    // idk if we need to worry about little and big endian...
-    // can encapsulate this into a sendpkt(int fd, void *pkt, int len)
-    // function that dumps, calls htoNdr and adds checksum
     send(fd, p, p->len, 0);
 
     stcpSCB->state = STCP_SENDER_SYN_SENT;
@@ -197,14 +306,14 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
 
     stcpSCB->state = STCP_SENDER_ESTABLISHED;
 
-    // Should this also do the memcpy, checksum?
-    packet *rpkt = checkpkt(buffer, len, ACK, p->hdr->seqNo + 1);
+    packet *rpkt = bfrToPkt(buffer, len);
+    checkpktflagsAck(rpkt, ACK, p->hdr->seqNo + 1);
     if (!rpkt) {
         printf("checkpkt error\n");
         goto cleanupBoth;
     }
 
-
+    setStcbSCBReceivedPkt(stcpSCB, rpkt);
 
     stcpSCB->state = STCP_SENDER_ESTABLISHED;
     packetChecksum(rpkt, len);
@@ -295,8 +404,8 @@ int main(int argc, char **argv) {
     cb = stcp_open(destinationHost, sendersPort, receiversPort);
     if (cb == NULL) {
         /* YOUR CODE HERE */
+        // TODO: Handle case when open fails
     }
-
     /* Start to send data in file via STCP to remote receiver. Chop up
      * the file into pieces as large as max packet size and transmit
      * those pieces.
@@ -308,6 +417,9 @@ int main(int argc, char **argv) {
         if (num_read_bytes <= 0)
             break;
 
+        // TODO: decide if I like this control flow
+        // when should I return STCP_ERROR? Should this path
+        // send a reset?
         if (stcp_send(cb, buffer, num_read_bytes) == STCP_ERROR) {
             /* YOUR CODE HERE */
         }
