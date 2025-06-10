@@ -41,7 +41,7 @@
 typedef struct {
     packet pkt;
     unsigned int seqno; // TODO: Do I need this field?
-    int retransmitCount;
+    int timeout;
     long timeSentMs;
 
 } sentPacket;
@@ -51,7 +51,7 @@ typedef struct {
     unsigned int writeIndex; // point to the next empty slot in the buffer
     unsigned int readIndex; // point to the oldest unacknowledged packet
     unsigned int capacity; // maximum capacity of the ring buffer
-    unsigned int sizeBytes; // the number of bytes currently stored in the buffer
+    unsigned short sizeBytes; // the number of bytes currently stored in the buffer
     unsigned int size; // num of elements in the ring buffer
 } ringbuffer;
 
@@ -60,12 +60,30 @@ typedef struct {
     /* YOUR CODE HERE */
     int fd;
     int state;
-    ringbuffer *sentPackets; // network byte order
-    unsigned int lastSentSeq; // host byte order
-    unsigned int lastAck; // host byte order
+    ringbuffer *rb; // ring buffer for sent packets
+    unsigned int nextSeq; // last seqno sent, host byte order
+    unsigned int lastSeq; // last received seqno, host byte order
+    unsigned int nextAck; // next ack to send, host byte order
+    int lastLen; // length of last packet
+    unsigned int lastAck; // last ack received, host byte order
+    unsigned short rwnd; // most recent receive window size
 
 } stcp_send_ctrl_blk;
 /* ADD ANY EXTRA FUNCTIONS HERE */
+
+/*
+ * send a packet, updating the timeSentMs field
+ */
+void sendPacket(int fd, sentPacket *spkt) {
+    spkt->timeSentMs = now();
+    printf("\033[32mPacket length is %d\033[0m\n", spkt->pkt.len);
+    int val = send(fd, &spkt->pkt, spkt->pkt.len, 0);
+
+    if (val == EMSGSIZE || val == -1) {
+        printf("Error writing to socket in stcp_open\n");
+        exit(EXIT_FAILURE);
+    }
+}
 
 static ringbuffer *rbInit() {
     ringbuffer *rb = malloc(sizeof(ringbuffer));
@@ -102,7 +120,7 @@ static stcp_send_ctrl_blk *cbInit(int fd) {
     }
     cb->fd = fd;
     cb->state = STCP_SENDER_CLOSED;
-    cb->sentPackets = rbInit();
+    cb->rb = rbInit();
     return cb;
 }
 
@@ -119,22 +137,30 @@ static bool rbAdd(ringbuffer *rb, sentPacket spkt) {
     rb->sentPackets[rb->writeIndex] = spkt;
 
     rb->size++;
-    rb->sizeBytes += spkt.pkt.len;
+
+    int sizeIncrease = (unsigned short) (spkt.pkt.len - sizeof(tcpheader));
+
+    printf("\033[32mAdding %hu to sending window size\033[0m\n", sizeIncrease);
+    rb->sizeBytes += sizeIncrease;
     rb->writeIndex = (rb->writeIndex + 1) % rb->capacity;
 
     return true;
 }
 
-// starting from the write pointer, free packets if they are less than ackNo
-static void rbRemoveAck(ringbuffer *rb, unsigned int ackNo) {
+// starting from the read index, increment read index until we reach an
+// unacknowledged packet
+static void removeAckdPkts(ringbuffer *rb, unsigned int ackNo) {
     while (rb->size > 0) {
-        unsigned int oldestSeqNo = rb->sentPackets[rb->readIndex].pkt.hdr->ackNo;
+        sentPacket spkt = rb->sentPackets[rb->readIndex];// .pkt.hdr->seqNo;
+        unsigned int oldestSeqNo = spkt.seqno;
 
-        if (greater32(ackNo, oldestSeqNo)) {
+        if (!greater32(ackNo, oldestSeqNo)) {
             return;
         }
 
-        rb->sizeBytes -= rb->sentPackets[rb->readIndex].pkt.len;
+        int sizeIncrease = (unsigned short) (spkt.pkt.len - sizeof(tcpheader));
+        printf("\033[32mRemoving %hu from sending window size\033[0m\n", sizeIncrease);
+        rb->sizeBytes -= sizeIncrease;
         rb->size--;
         rb->readIndex = (rb->readIndex + 1) % rb->capacity;
 
@@ -160,24 +186,10 @@ static int freeCtrlBlk(stcp_send_ctrl_blk *cb) {
         printf("Tried to free ctrl_blk when there is no ctrl_blk\n");
         return STCP_ERROR;
     }
-    // TODO: update for buffers
-    if (cb->sentPackets) rbFree(cb->sentPackets);
+    if (cb->rb) rbFree(cb->rb);
     close(cb->fd);
     free(cb);
     return STCP_SUCCESS;
-}
-
-// lastSentSeq is in network order bytes
-// returns host order byte
-static unsigned int nextSeq(unsigned int increment, unsigned int lastSentSeq) {
-    unsigned int last = ntohl(lastSentSeq);
-    return plus32(last, increment);
-}
-
-// receivedSeq is in host order bytes
-// returns host order byte
-static unsigned int nextAck(int len, unsigned int receivedSeq) {
-    return plus32(receivedSeq, len);
 }
 
 /* Create the send packet struct
@@ -195,6 +207,9 @@ static sentPacket spktInit(int flags, unsigned short rwnd, unsigned int seq, uns
     createSegment(&spkt.pkt, flags, rwnd, seq, ack, spkt.pkt.data, len);
     dump('s', spkt.pkt.hdr, spkt.pkt.len);
 
+    spkt.seqno = seq;
+    printf("spktInit seqNo %u\n", spkt.seqno);
+
     // convert packet header to network byte order
     htonHdr(spkt.pkt.hdr);
 
@@ -202,19 +217,14 @@ static sentPacket spktInit(int flags, unsigned short rwnd, unsigned int seq, uns
     spkt.pkt.hdr->checksum = ipchecksum(spkt.pkt.hdr, spkt.pkt.len);
 
     // add info for sentPacket struct
-    spkt.seqno = seq;
     spkt.timeSentMs = now();
-    spkt.retransmitCount = 0;
+    spkt.timeout = STCP_MIN_TIMEOUT;
 
     return spkt;
 }
 
-static packet *bfrToPkt(unsigned char *buffer, int len) {
-    packet *pkt = malloc(sizeof(packet));
-    if (!pkt) {
-        return NULL;
-    }
-
+// copies from given buffer to a packet pointer
+static packet *bfrToPkt(packet *pkt, unsigned char *buffer, int len) {
     pkt->len = len;
 
     memcpy(pkt->data, buffer, len);
@@ -250,58 +260,93 @@ static bool checkPktAck(packet *pkt, unsigned int expectedAckNo) {
  * The function returns STCP_SUCCESS on success, or STCP_ERROR on error.
  */
 int stcp_send(stcp_send_ctrl_blk *stcp_CB, unsigned char* data, int length) {
-    /* YOUR CODE HERE */
-    // For now, do NOT break data into multiple packets. Send one packet
-    // then close the connection
+    // divide up data into chunks, up to STCP_MTU + last remainder.
+    // when total_size == rwnd, begin transmission
 
-    // TODO: loop to break the data into pieces and call preparepkt
+    while (length > 0) {
 
-    // create packet and send it
-    // ADD 1 to first seq # after SYN
+        // prepare all packets, add to ring buffer
+        while (stcp_CB->rb->sizeBytes <= stcp_CB->rwnd) {
+            unsigned short receiveWindowLeft = stcp_CB->rwnd - stcp_CB->rb->sizeBytes;
+            unsigned short packetSize = min(min(STCP_MSS, length), receiveWindowLeft);
+            if (packetSize == 0) break;
+            sentPacket spkt = spktInit(ACK, STCP_MAXWIN, stcp_CB->nextSeq, stcp_CB->nextAck, data, packetSize);
 
-    unsigned int nSeq = nextSeq(1, stcp_CB->pktSent->hdr->seqNo);
-    unsigned int nAck = nextAck(stcp_CB->pktRec->len, stcp_CB->pktRec->hdr->seqNo);
-    packet *spkt = preparepkt(ACK, STCP_MTU, nSeq, nAck, data, length); 
-    setStcbSentPkt(stcp_CB, spkt);
-    send(stcp_CB->fd, spkt, spkt->len, 0);
+            rbAdd(stcp_CB->rb, spkt);
 
-    // wait for ack and check it
+            data += packetSize; // increment pointer to next portion of data
+            length -= packetSize; // keep track of remaining length
+            stcp_CB->nextSeq = plus32(packetSize, stcp_CB->nextSeq);
+            if (length <= 0) break;
 
-    unsigned char buffer[STCP_MTU];
-    int len = readWithTimeout(stcp_CB->fd, buffer, STCP_MIN_TIMEOUT);
+            if (receiveWindowLeft == 0) break;
+        }
 
-    if (len == STCP_READ_TIMED_OUT) {
-        // TODO: Handle this case properly
-        goto cleanupPacket;
-    } else if (len == STCP_READ_PERMANENT_FAILURE) {
-        goto cleanupPacket;
+        unsigned int idx = 0;
+        while (greater32(stcp_CB->rb->size, idx)) {
+            // loop through ring buffer, sending all packets
+            printf("sending packet\n");
+            sentPacket spkt = stcp_CB->rb->sentPackets[(stcp_CB->rb->readIndex + idx) % stcp_CB->rb->capacity];
+            sendPacket(stcp_CB->fd, &spkt);
+            idx++;
+        }
+
+        printf("\033[31mReceive window size %hu sending window size %hu\033[0m\n",stcp_CB->rwnd ,stcp_CB->rb->sizeBytes);
+
+        // Reading packets loop
+        int len;
+        int timeout = STCP_MIN_TIMEOUT;
+        unsigned int greatestAck = stcp_CB->lastAck;
+        while ((now() - stcp_CB->rb->sentPackets[stcp_CB->rb->readIndex].timeSentMs) < timeout) {
+            packet p;
+            unsigned char bfr[STCP_MTU];
+
+            // read pkt
+            // TODO: Fast Retransmission
+            len = readWithTimeout(stcp_CB->fd, bfr, 5);
+
+            if (len == STCP_READ_TIMED_OUT) {
+                continue; // this timeout doesn't mean anything, only the while loop
+                // exiting will mean something
+            } else if (len == STCP_READ_PERMANENT_FAILURE) {
+                printf("socket permanent failure\n");
+                exit(EXIT_FAILURE);
+            } else {
+                // parse pkt
+                bfrToPkt(&p, bfr, len);
+
+                // checksum
+                if (!packetChecksum(&p, len)) continue; // checksum doesn't match; discard packet
+
+                // convert to host byte order
+                ntohHdr(p.hdr);
+
+                // check flags
+                if (!checkPktFlags(&p, ACK)) continue;
+
+                // rbRemoveAck
+                if (greater32(p.hdr->ackNo, greatestAck)) greatestAck = p.hdr->ackNo;
+
+                removeAckdPkts(stcp_CB->rb, greatestAck);
+                stcp_CB->nextAck = p.hdr->seqNo + 1; // TODO: update to cumulative ack
+                // do this by... updating the last ack
+                stcp_CB->lastAck = p.hdr->ackNo;
+                printf("received seqno %u\n", p.hdr->seqNo);
+                stcp_CB->lastSeq = ntohl(p.hdr->seqNo);
+
+                unsigned short rwnd = p.hdr->windowSize;
+                if (rwnd != stcp_CB->rwnd) {
+                    printf("\033[mUpdating receive window size to %hu\033[m\n", rwnd);
+                    stcp_CB->rwnd = rwnd;
+                } 
+            }
+
+        }
+
+
     }
 
-    // Move received data to packet struct
-    packet *rpkt = bfrToPkt(buffer, len);
-    if (!packetChecksum(rpkt, len)) {
-        goto cleanupPacket;
-    }
-    htonHdr(rpkt->hdr);
-
-    // Check packet has ACK flag and correct seq no
-    // TODO: check ackNo at some point
-    if (checkPktAck(rpkt, nextAck(stcp_CB->pktSent->len,
-                                        ntohl(stcp_CB->pktSent->hdr->seqNo))), checkPktFlags(rpkt, ACK)) {
-
-    }
-    // TODO: Handle this case properly... what is this case?
-    if (!rpkt) {
-        printf("checkpkt error\n");
-        goto cleanupPacket;
-    }
-
-    setStcbSCBReceivedPkt(stcp_CB, rpkt);
     return STCP_SUCCESS;
-
-cleanupPacket:
-    free(spkt);
-    return STCP_ERROR;
 }
 
 
@@ -334,58 +379,55 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
     (void) fd;
 
     /* YOUR CODE HERE */
-
-    // starting seq # = 0, not random
     srand(time(NULL));
     unsigned int rnd = (unsigned int) rand();
     stcp_send_ctrl_blk *cb = cbInit(fd);
-    cb->sentPackets = rbInit();
+    cb->rb = rbInit();
 
 
     sentPacket spkt = spktInit(SYN, STCP_MAXWIN, rnd, 0, NULL, 0);
 
-    cb->lastSentSeq = spkt.seqno;
+    cb->nextSeq = plus32(1, spkt.seqno);
 
-    rbAdd(cb->sentPackets, p);
-
-    send(fd, p, p->len, 0);
+    // receiving temp buffer
+    unsigned char buffer[STCP_MTU];
 
     cb->state = STCP_SENDER_SYN_SENT;
 
-    // We sent the packet, now wait for the ACK
-    unsigned char buffer[STCP_MTU];
-    int len = readWithTimeout(fd, buffer, STCP_MIN_TIMEOUT);
+    int len;
+    int timeout = STCP_MIN_TIMEOUT;
 
-    if (len == STCP_READ_TIMED_OUT) {
-        // TODO: Handle this case
-        goto cleanupBoth;
-    } else if (len == STCP_READ_PERMANENT_FAILURE) {
-        goto cleanupBoth;
+    while (true) {
+
+        sendPacket(fd, &spkt);
+
+        // receive
+        len = readWithTimeout(fd, buffer, timeout);
+
+        if (len == STCP_READ_TIMED_OUT) {
+            timeout = stcpNextTimeout(timeout);
+            continue;
+        } else if (len == STCP_READ_PERMANENT_FAILURE) {
+            printf("socket permanent failure\n");
+            exit(EXIT_FAILURE);
+        } else {
+            // check checksum and flags
+            // TODO: change this to 
+            packet rpkt;
+            bfrToPkt(&rpkt, buffer, len);
+            packetChecksum(&rpkt, len);
+            ntohHdr(rpkt.hdr);
+            if (!(checkPktFlags(&rpkt, SYN | ACK) && checkPktAck(&rpkt, spkt.seqno + 1))) {
+                continue; // ignore packet
+            } else {
+                cb->lastAck = rpkt.hdr->ackNo;
+                cb->nextAck = rpkt.hdr->seqNo + 1;
+                cb->rwnd = rpkt.hdr->windowSize;
+                removeAckdPkts(cb->rb, rpkt.hdr->ackNo);
+                return cb;
+            }
+        }
     }
-
-    stcpSCB->state = STCP_SENDER_ESTABLISHED;
-
-    packet *rpkt = bfrToPkt(buffer, len);
-    packetChecksum(rpkt, len);
-    htonHdr(rpkt->hdr);
-
-    if (!(checkPktFlags(rpkt, ACK) && checkPktAck(rpkt, p->hdr->seqNo + 1))) {
-
-        // TODO: Handle this case better
-        printf("checkPkt or pktFlag error\n");
-        goto cleanupBoth;
-    }
-
-    setStcbSCBReceivedPkt(stcpSCB, rpkt);
-
-
-    return stcpSCB;
-
-cleanupBoth:
-    free(stcpSCB);
-cleanupPacket:
-    free(p);
-    return NULL;
 }
 
 
@@ -399,65 +441,52 @@ cleanupPacket:
  * Returns STCP_SUCCESS on success or STCP_ERROR on error.
  */
 int stcp_close(stcp_send_ctrl_blk *cb) {
-    /* YOUR CODE HERE */
-    printf("STCP CLOSE\n");
-
-    // send FIN packet without ACK flag
     cb->state = STCP_SENDER_CLOSING;
-    unsigned int nSeq = nextSeq((unsigned int)(cb->pktSent->len - sizeof(tcpheader)), cb->pktSent->hdr->seqNo);
-    packet *spkt = preparepkt(FIN, STCP_MTU, nSeq, 0, 0, 0); 
-    setStcbSentPkt(cb, spkt);
-    send(cb->fd, spkt, spkt->len, 0);
 
-    // enter FIN WAIT state
-    cb->state = STCP_SENDER_FIN_WAIT;
+    printf("last sent seqno %u\n", cb->nextSeq);
 
-    // receive the FIN ACK packet
+    sentPacket spkt = spktInit(FIN, STCP_MAXWIN, cb->nextSeq, cb->nextSeq, NULL, 0);
+
+    int len;
+    int timeout = STCP_MIN_TIMEOUT;
+
     unsigned char buffer[STCP_MTU];
-    int len = readWithTimeout(cb->fd, buffer, STCP_INITIAL_TIMEOUT);
 
-    if (len == STCP_READ_TIMED_OUT) {
-        // TODO: Handle this case properly
-        goto cleanupPacket;
-    } else if (len == STCP_READ_PERMANENT_FAILURE) {
-        goto cleanupPacket;
+    while (true) {
+        sendPacket(cb->fd, &spkt);
+
+        len = readWithTimeout(cb->fd, buffer, timeout);
+
+        if (len == STCP_READ_TIMED_OUT) {
+            timeout = stcpNextTimeout(timeout);
+            printf("timeout %d\n", timeout);
+            if (timeout >= STCP_MAX_TIMEOUT) break;
+
+            continue;
+        } else if (len == STCP_READ_PERMANENT_FAILURE) {
+            printf("socket permanent failure in stcp_close\n");
+            exit(EXIT_FAILURE);
+        } else {
+            packet rpkt;
+            bfrToPkt(&rpkt, buffer, len);
+            packetChecksum(&rpkt, len);
+            ntohHdr(rpkt.hdr);
+
+            if (!checkPktFlags(&rpkt, FIN | ACK) &&
+                checkPktAck(&rpkt, spkt.seqno + 1)) {
+                continue; // ignore packet
+            } else {
+                break;
+            }
+
+        }
+
     }
 
-    // Move received data to packet struct
-    packet *rpkt = bfrToPkt(buffer, len);
-    if (!packetChecksum(rpkt, len)) {
-        goto cleanupPacket;
-    }
-    htonHdr(rpkt->hdr);
-
-    // Check packet has ACK flag and correct seq no
-    // TODO: check ackNo at some point
-    if (!(checkPktFlags(rpkt, ACK) && checkPktAck(rpkt, nextAck(cb->pktSent->len,
-                                        ntohl(cb->pktSent->hdr->seqNo) + 1)))) {
-        // Flag is wrong or ack # is wrong...
-    }
-
-    // TODO: Handle this case properly... what is this case?
-    if (!rpkt) {
-        printf("checkpkt error\n");
-        goto cleanupPacket;
-    }
-
-    setStcbSCBReceivedPkt(cb, rpkt);
-
-    // Close state
-    cb->state = STCP_SENDER_CLOSED;
-    // free the control block
     freeCtrlBlk(cb);
-
     return STCP_SUCCESS;
-
-cleanupPacket:
-    printf("STCP_ERROR\n");
-    free(rpkt);
-    free(spkt);
-    return STCP_ERROR;
 }
+
 /*
  * Return a port number based on the uid of the caller.  This will
  * with reasonably high probability return a port number different from
@@ -485,7 +514,8 @@ int main(int argc, char **argv) {
     /* You might want to change the size of this buffer to test how your
      * code deals with different packet sizes.
      */
-    unsigned char buffer[STCP_MSS];
+    // TODO: change this to be larger
+    unsigned char buffer[STCP_MAXWIN];
     int num_read_bytes;
 
     // ADD packet to the logging
@@ -521,8 +551,10 @@ int main(int argc, char **argv) {
     cb = stcp_open(destinationHost, sendersPort, receiversPort);
     if (cb == NULL) {
         /* YOUR CODE HERE */
-        // TODO: Handle case when open fails
+        printf("ctrl_blk returned from stcb_open() was NULL\n");
+        exit(EXIT_FAILURE);
     }
+
     printf("SYN handshake complete\n");
     /* Start to send data in file via STCP to remote receiver. Chop up
      * the file into pieces as large as max packet size and transmit
